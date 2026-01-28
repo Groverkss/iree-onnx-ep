@@ -88,6 +88,9 @@ class IreeEpFactory : public OrtEpFactory, public ApiPtrs {
       const OrtKeyValuePairs* stream_options,
       OrtSyncStreamImpl** stream) noexcept;
 
+  // Enumerate IREE devices and create OrtHardwareDevice instances.
+  void CreateIreeHwDevices();
+
   // Member variables
   Ort::Logger logger_;
   const std::string ep_name_;
@@ -95,9 +98,9 @@ class IreeEpFactory : public OrtEpFactory, public ApiPtrs {
   // IREE runtime instance (shared across all EPs created by this factory).
   RuntimeInstancePtr instance_;
 
-  // Virtual OrtHardwareDevice instances created by this factory.
+  // OrtHardwareDevice instances created by this factory.
   // Owned by the factory and released in the destructor.
-  std::vector<OrtHardwareDevice*> virtual_hw_devices_;
+  std::vector<OrtHardwareDevice*> hw_devices_;
 };
 
 }  // namespace iree_onnx_ep
