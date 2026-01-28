@@ -3,13 +3,19 @@
 #ifndef IREE_ONNX_EP_SRC_IREE_EP_FACTORY_H_
 #define IREE_ONNX_EP_SRC_IREE_EP_FACTORY_H_
 
+#include <memory>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "iree_wrappers.h"
 #include "ort_import.h"
 
 namespace iree_onnx_ep {
+
+// Forward declarations.
+class IreeAllocator;
+class IreeDataTransfer;
 
 // EP configuration constants
 inline constexpr const char* kEpVendor = "IREE";
@@ -43,6 +49,13 @@ class IreeEpFactory : public OrtEpFactory, public ApiPtrs {
 
   // Accessor for the shared IREE runtime instance.
   iree_runtime_instance_t* IreeInstance() const { return instance_.Get(); }
+
+  // Gets or creates a HAL device for the given device_id.
+  // Returns nullptr if device_id is invalid.
+  iree_hal_device_t* GetDeviceForId(uint32_t device_id);
+
+  // Accessor for the logger.
+  const Ort::Logger& Logger() const { return logger_; }
 
  private:
   // Factory interface implementations (called via function pointers)
@@ -101,6 +114,22 @@ class IreeEpFactory : public OrtEpFactory, public ApiPtrs {
   // OrtHardwareDevice instances created by this factory.
   // Owned by the factory and released in the destructor.
   std::vector<OrtHardwareDevice*> hw_devices_;
+
+  // Cache of HAL devices by device_id. Created lazily when allocator is needed.
+  // TODO(thread-safety): Add mutex for thread-safe access.
+  std::unordered_map<uint32_t, HalDevicePtr> device_cache_;
+
+  // Memory info objects for device-local memory, indexed by device_id.
+  // These must be kept alive for the lifetime of the factory since
+  // EpDevice_AddAllocatorInfo does not copy the OrtMemoryInfo.
+  std::vector<Ort::MemoryInfo> device_memory_infos_;
+
+  // Allocators by device_id. Created lazily when requested.
+  // TODO(thread-safety): Add mutex for thread-safe access.
+  std::unordered_map<uint32_t, std::unique_ptr<IreeAllocator>> allocators_;
+
+  // Shared data transfer instance. Created lazily when requested.
+  std::unique_ptr<IreeDataTransfer> data_transfer_;
 };
 
 }  // namespace iree_onnx_ep

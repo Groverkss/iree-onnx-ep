@@ -136,6 +136,8 @@ add_library(iree_onnx_ep SHARED
   src/iree_compile.cc
   src/mlir_gen.cc
   src/iree_ort_utils.cc
+  src/iree_allocator.cc
+  src/iree_data_transfer.cc
   src/temp_file.cc
 )
 

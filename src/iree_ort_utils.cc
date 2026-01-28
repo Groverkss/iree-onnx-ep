@@ -6,6 +6,7 @@
 
 #include "iree/hal/buffer_transfer.h"
 #include "iree/hal/buffer_view_util.h"
+#include "iree_ep_factory.h"
 
 namespace iree_onnx_ep {
 
@@ -113,16 +114,13 @@ size_t OnnxElementTypeSize(ONNXTensorElementDataType type) {
 // Buffer/Tensor Conversion
 // ============================================================================
 
-// TODO: The implementation of these functions is a bit wrong. We are ASSUMING
-// that the ort tensors are on the host and the iree tensors will live on the
-// device. We should move to checking where the ort tensor lives and copying
-// the data if needed.
-
 OrtStatus* OrtTensorToIreeBufferView(const Ort::ConstValue& ort_value,
                                      iree_hal_device_t* device,
                                      iree_hal_allocator_t* allocator,
                                      iree_allocator_t /*host_allocator*/,
-                                     iree_hal_buffer_view_t** out_buffer_view) {
+                                     iree_hal_buffer_view_t** out_buffer_view,
+                                     const OrtEpApi& ep_api,
+                                     const Ort::Logger& logger) {
   *out_buffer_view = nullptr;
 
   // Get tensor info from ORT.
@@ -137,12 +135,43 @@ OrtStatus* OrtTensorToIreeBufferView(const Ort::ConstValue& ort_value,
         .release();
   }
 
-  // Get raw data pointer.
-  const void* data = ort_value.GetTensorRawData();
-  size_t byte_size = CalculateTensorByteSize(shape, onnx_dtype);
-
   // Convert shape to IREE format.
   std::vector<iree_hal_dim_t> iree_shape(shape.begin(), shape.end());
+  size_t byte_size = CalculateTensorByteSize(shape, onnx_dtype);
+
+  // Check if tensor is already on an IREE device.
+  const OrtMemoryDevice* mem_device =
+      ep_api.Value_GetMemoryDevice(ort_value.operator const OrtValue*());
+  if (mem_device) {
+    uint32_t vendor_id = ep_api.MemoryDevice_GetVendorId(mem_device);
+    if (vendor_id == kEpVendorId) {
+      // Tensor already on IREE device - wrap existing buffer without copy.
+      ORT_CXX_LOGF_NOEXCEPT(logger, ORT_LOGGING_LEVEL_INFO,
+                            "IREE EP: Input tensor already on device, "
+                            "wrapping existing buffer (%zu bytes)",
+                            byte_size);
+
+      const void* data_ptr = ort_value.GetTensorRawData();
+      iree_hal_buffer_t* buffer =
+          static_cast<iree_hal_buffer_t*>(const_cast<void*>(data_ptr));
+
+      // Create buffer view wrapping existing buffer (no copy).
+      IREE_ORT_RETURN_IF_ERROR(iree_hal_buffer_view_create(
+          buffer, iree_shape.size(), iree_shape.data(), iree_dtype,
+          IREE_HAL_ENCODING_TYPE_DENSE_ROW_MAJOR,
+          iree_hal_device_host_allocator(device), out_buffer_view));
+
+      return nullptr;
+    }
+  }
+
+  // Tensor is on host - copy to device.
+  ORT_CXX_LOGF_NOEXCEPT(logger, ORT_LOGGING_LEVEL_INFO,
+                        "IREE EP: Copying input tensor to device (%zu bytes)",
+                        byte_size);
+
+  // Get raw data pointer.
+  const void* data = ort_value.GetTensorRawData();
 
   // Set up buffer parameters for device-local memory.
   iree_hal_buffer_params_t buffer_params = {};
@@ -160,11 +189,43 @@ OrtStatus* OrtTensorToIreeBufferView(const Ort::ConstValue& ort_value,
 
 OrtStatus* IreeBufferViewToOrtTensor(iree_hal_buffer_view_t* buffer_view,
                                      Ort::UnownedValue ort_value,
-                                     iree_hal_device_t* device) {
+                                     iree_hal_device_t* device,
+                                     const OrtEpApi& ep_api,
+                                     const Ort::Logger& logger) {
   // Get buffer from view.
   iree_hal_buffer_t* buffer = iree_hal_buffer_view_buffer(buffer_view);
   iree_device_size_t byte_length =
       iree_hal_buffer_view_byte_length(buffer_view);
+
+  // Check if output tensor is on an IREE device.
+  const OrtMemoryDevice* mem_device =
+      ep_api.Value_GetMemoryDevice(ort_value.operator OrtValue*());
+  if (mem_device) {
+    uint32_t vendor_id = ep_api.MemoryDevice_GetVendorId(mem_device);
+    if (vendor_id == kEpVendorId) {
+      // Output is on device - copy buffer directly (D2D).
+      ORT_CXX_LOGF_NOEXCEPT(logger, ORT_LOGGING_LEVEL_INFO,
+                            "IREE EP: Output tensor on device, performing D2D "
+                            "copy (%zu bytes)",
+                            static_cast<size_t>(byte_length));
+
+      iree_hal_buffer_t* dst_buffer =
+          static_cast<iree_hal_buffer_t*>(ort_value.GetTensorMutableRawData());
+
+      IREE_ORT_RETURN_IF_ERROR(iree_hal_device_transfer_d2d(
+          device, buffer, /*source_offset=*/0, dst_buffer, /*target_offset=*/0,
+          byte_length, IREE_HAL_TRANSFER_BUFFER_FLAG_DEFAULT,
+          iree_infinite_timeout()));
+
+      return nullptr;
+    }
+  }
+
+  // Output tensor is on host - transfer from device to host.
+  ORT_CXX_LOGF_NOEXCEPT(
+      logger, ORT_LOGGING_LEVEL_INFO,
+      "IREE EP: Copying output tensor from device (%zu bytes)",
+      static_cast<size_t>(byte_length));
 
   // Get destination pointer from ORT tensor.
   void* dest_data = ort_value.GetTensorMutableRawData();

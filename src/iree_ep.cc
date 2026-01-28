@@ -53,14 +53,14 @@ static std::vector<std::string> GenerateCompileFlags(
 
 IreeEp::IreeEp(IreeEpFactory& factory, const std::string& name,
                const Config& config, const OrtLogger& logger,
-               HalDevicePtr device)
+               uint32_t device_id)
     : OrtEp{},
       ApiPtrs(static_cast<const ApiPtrs&>(factory)),
       factory_(factory),
       name_(name),
       config_(config),
       logger_(&logger),
-      device_(std::move(device)) {
+      device_id_(device_id) {
   // Set ORT version we support
   ort_version_supported = ORT_API_VERSION;
 
@@ -69,6 +69,15 @@ IreeEp::IreeEp(IreeEpFactory& factory, const std::string& name,
   GetCapability = GetCapabilityImpl;
   Compile = CompileImpl;
   ReleaseNodeComputeInfos = ReleaseNodeComputeInfosImpl;
+}
+
+IreeEp::~IreeEp() {
+  // Note: Avoid using logger during cleanup - ORT logging infrastructure may
+  // be torn down before EP destructors run during Python interpreter shutdown.
+}
+
+iree_hal_device_t* IreeEp::IreeDevice() const {
+  return factory_.GetDeviceForId(device_id_);
 }
 
 /*static*/
@@ -227,6 +236,13 @@ IreeNodeComputeInfo::IreeNodeComputeInfo(IreeEp& ep_ref,
   ReleaseState = ReleaseStateImpl;
 }
 
+IreeNodeComputeInfo::~IreeNodeComputeInfo() {
+  // Note: Avoid using logger during cleanup - ORT logging infrastructure may
+  // be torn down before our destructors run during Python interpreter shutdown.
+  // Explicitly release session to ensure proper cleanup ordering.
+  session_.Reset();
+}
+
 /*static*/
 OrtStatus* ORT_API_CALL IreeNodeComputeInfo::CreateStateImpl(
     OrtNodeComputeInfo* /*this_ptr*/,
@@ -248,7 +264,7 @@ OrtStatus* ORT_API_CALL IreeNodeComputeInfo::ComputeImpl(
   iree_hal_allocator_t* allocator =
       iree_runtime_session_device_allocator(info->session_.Get());
 
-  // Step 1: Convert ORT inputs to IREE buffer views.
+  // Convert ORT inputs to IREE buffer views.
   std::vector<HalBufferViewPtr> input_views;
   size_t input_count = ctx.GetInputCount();
   input_views.reserve(input_count);
@@ -257,27 +273,34 @@ OrtStatus* ORT_API_CALL IreeNodeComputeInfo::ComputeImpl(
     Ort::ConstValue input = ctx.GetInput(i);
     iree_hal_buffer_view_t* view = nullptr;
     ORT_RETURN_IF_ERROR(OrtTensorToIreeBufferView(
-        input, device, allocator, iree_allocator_system(), &view));
+        input, device, allocator, iree_allocator_system(), &view,
+        info->ep.ep_api, info->ep.Logger()));
     input_views.emplace_back(view);
   }
 
-  // Step 2: Initialize the call.
+  // Initialize the call.
   RuntimeCall call;
   IREE_ORT_RETURN_IF_ERROR(iree_runtime_call_initialize(
       info->session_.Get(), info->function_, call.Get()));
   call.MarkInitialized();
 
-  // Step 3: Push input buffer views.
+  // Push input buffer views.
   for (auto& view : input_views) {
     IREE_ORT_RETURN_IF_ERROR(
         iree_runtime_call_inputs_push_back_buffer_view(call.Get(), view.Get()));
   }
 
-  // Step 4: Invoke the function.
+  // Invoke the function.
   IREE_ORT_RETURN_IF_ERROR(
       iree_runtime_call_invoke(call.Get(), IREE_RUNTIME_CALL_FLAG_RESERVED));
 
-  // Step 5: Pop outputs and copy to ORT tensors.
+  // Pop outputs and copy to ORT tensors.
+  //
+  // TODO(perf): Currently IREE allocates its own output buffers, then we copy
+  // to ORT's pre-allocated device buffers (D2D copy). We could eliminate this
+  // copy by pre-binding ORT's buffers as IREE outputs before invoke. This
+  // requires investigating iree_runtime_call_outputs_push_back_buffer_view or
+  // similar APIs to provide pre-allocated output buffers to IREE.
   iree_vm_list_t* output_list = iree_runtime_call_outputs(call.Get());
   iree_host_size_t output_count = iree_vm_list_size(output_list);
 
@@ -300,13 +323,11 @@ OrtStatus* ORT_API_CALL IreeNodeComputeInfo::ComputeImpl(
           .release();
     }
 
-    // Allocate ORT output tensor.
+    // Allocate ORT output tensor and copy data from IREE buffer.
     Ort::UnownedValue output = ctx.GetOutput(i, shape.data(), shape.size());
-
-    // Copy data from IREE buffer to ORT tensor.
-    ORT_RETURN_IF_ERROR(IreeBufferViewToOrtTensor(output_view, output, device));
+    ORT_RETURN_IF_ERROR(IreeBufferViewToOrtTensor(
+        output_view, output, device, info->ep.ep_api, info->ep.Logger()));
   }
-
   return nullptr;
 }
 

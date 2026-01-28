@@ -37,7 +37,10 @@ size_t OnnxElementTypeSize(ONNXTensorElementDataType type);
 // ============================================================================
 
 // Converts an ORT input tensor to an IREE buffer view.
-// The buffer view is allocated on the device and data is copied from host.
+//
+// If the tensor is already on an IREE device (detected via vendor_id), the
+// existing buffer is wrapped in a view without copying data. Otherwise, a new
+// buffer is allocated on the device and data is copied from host.
 //
 // Parameters:
 //   ort_value - Input ORT tensor (const, read-only)
@@ -45,26 +48,37 @@ size_t OnnxElementTypeSize(ONNXTensorElementDataType type);
 //   allocator - Device allocator from session
 //   host_allocator - Host allocator for metadata
 //   out_buffer_view - Output buffer view (caller must release)
+//   ep_api - EP API for checking memory device info
+//   logger - Logger for tracing
 //
 // Returns nullptr on success, OrtStatus* on error.
 OrtStatus* OrtTensorToIreeBufferView(const Ort::ConstValue& ort_value,
                                      iree_hal_device_t* device,
                                      iree_hal_allocator_t* allocator,
                                      iree_allocator_t host_allocator,
-                                     iree_hal_buffer_view_t** out_buffer_view);
+                                     iree_hal_buffer_view_t** out_buffer_view,
+                                     const OrtEpApi& ep_api,
+                                     const Ort::Logger& logger);
 
 // Copies data from an IREE buffer view to an ORT output tensor.
-// The ORT tensor must already be allocated with matching shape.
+//
+// If the output tensor is on an IREE device (detected via vendor_id), the
+// buffer is copied directly without device-to-host transfer. Otherwise, data
+// is transferred from device to host memory.
 //
 // Parameters:
 //   buffer_view - Input IREE buffer view
 //   ort_value - Output ORT tensor (mutable)
 //   device - IREE HAL device for transfer
+//   ep_api - EP API for checking memory device info
+//   logger - Logger for tracing
 //
 // Returns nullptr on success, OrtStatus* on error.
 OrtStatus* IreeBufferViewToOrtTensor(iree_hal_buffer_view_t* buffer_view,
                                      Ort::UnownedValue ort_value,
-                                     iree_hal_device_t* device);
+                                     iree_hal_device_t* device,
+                                     const OrtEpApi& ep_api,
+                                     const Ort::Logger& logger);
 
 // Extracts shape from an IREE buffer view as int64_t vector for ORT.
 std::vector<int64_t> GetBufferViewShape(iree_hal_buffer_view_t* buffer_view);

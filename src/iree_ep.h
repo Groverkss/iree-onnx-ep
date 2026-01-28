@@ -35,12 +35,15 @@ class IreeEp : public OrtEp, public ApiPtrs {
   };
 
   IreeEp(IreeEpFactory& factory, const std::string& name, const Config& config,
-         const OrtLogger& logger, HalDevicePtr device);
+         const OrtLogger& logger, uint32_t device_id);
 
-  ~IreeEp() = default;
+  ~IreeEp();
 
-  // Accessor for the IREE device (per-EP).
-  iree_hal_device_t* IreeDevice() const { return device_.Get(); }
+  // Accessor for the IREE device (from factory's device cache).
+  iree_hal_device_t* IreeDevice() const;
+
+  // Accessor for the logger.
+  const Ort::Logger& Logger() const { return logger_; }
 
  private:
   // EP interface implementations (called via function pointers)
@@ -72,8 +75,10 @@ class IreeEp : public OrtEp, public ApiPtrs {
   Config config_;
   Ort::Logger logger_;
 
-  // IREE HAL device (per-EP, created from factory's instance).
-  HalDevicePtr device_;
+  // Device ID for this EP. The actual HAL device is managed by the factory's
+  // device_cache_ and accessed via GetDeviceForId(). This ensures the EP and
+  // allocator use the same device instance.
+  uint32_t device_id_;
 };
 
 // Compute kernel for compiled nodes.
@@ -83,6 +88,8 @@ struct IreeNodeComputeInfo : OrtNodeComputeInfo {
   // Session is created in CompileImpl and passed here.
   IreeNodeComputeInfo(IreeEp& ep, RuntimeSessionPtr session,
                       iree_vm_function_t function);
+
+  ~IreeNodeComputeInfo();
 
   // Creates per-node computation state
   static OrtStatus* ORT_API_CALL CreateStateImpl(

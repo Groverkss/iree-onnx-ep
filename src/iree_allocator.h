@@ -1,0 +1,79 @@
+// iree_allocator.h - IREE device memory allocator for ORT.
+//
+// Implements OrtAllocator interface for allocating device-local memory using
+// IREE's HAL allocator. The allocator returns buffer handles
+// (iree_hal_buffer_t*) as opaque pointers, which ORT passes back to Free() when
+// memory is released.
+
+#ifndef IREE_ONNX_EP_SRC_IREE_ALLOCATOR_H_
+#define IREE_ONNX_EP_SRC_IREE_ALLOCATOR_H_
+
+#include <unordered_map>
+
+#include "iree_ep_factory.h"
+#include "iree_wrappers.h"
+#include "ort_import.h"
+
+namespace iree_onnx_ep {
+
+// Device memory allocator for IREE execution provider.
+//
+// Allocates device-local memory via IREE's HAL allocator. The Alloc() function
+// returns a pointer to an iree_hal_buffer_t (cast to void*), not the actual
+// device memory address. This handle is passed back to Free() when the memory
+// should be released.
+//
+// The allocator owns all allocated buffers and tracks them internally for
+// proper cleanup. Buffers are automatically released when the allocator is
+// destroyed.
+class IreeAllocator : public OrtAllocator {
+ public:
+  // Creates an allocator for the specified device.
+  //
+  // Args:
+  //   api_ptrs: ORT and EP API function pointers.
+  //   device_id: The IREE device ID (index in hw_devices_ list).
+  //   device: Non-owning pointer to the HAL device. Must outlive this
+  //   allocator. memory_info: ORT memory info describing this allocator. Takes
+  //   ownership. logger: Logger for allocation tracing.
+  IreeAllocator(const ApiPtrs& api_ptrs, uint32_t device_id,
+                iree_hal_device_t* device, const OrtMemoryInfo* memory_info,
+                const Ort::Logger& logger);
+
+  ~IreeAllocator();
+
+  // Non-copyable, non-movable (ORT holds pointer to this object).
+  IreeAllocator(const IreeAllocator&) = delete;
+  IreeAllocator& operator=(const IreeAllocator&) = delete;
+  IreeAllocator(IreeAllocator&&) = delete;
+  IreeAllocator& operator=(IreeAllocator&&) = delete;
+
+ private:
+  // OrtAllocator function pointer implementations.
+
+  // Allocates device-local memory.
+  // Returns iree_hal_buffer_t* cast to void* on success, nullptr on failure.
+  static void* ORT_API_CALL AllocImpl(OrtAllocator* this_, size_t size);
+
+  // Frees memory previously allocated by AllocImpl.
+  static void ORT_API_CALL FreeImpl(OrtAllocator* this_, void* p);
+
+  // Returns the memory info describing this allocator.
+  static const OrtMemoryInfo* ORT_API_CALL InfoImpl(const OrtAllocator* this_);
+
+  const ApiPtrs& api_ptrs_;
+  uint32_t device_id_;
+  iree_hal_device_t* device_;         // Non-owning (owned by factory/EP).
+  const OrtMemoryInfo* memory_info_;  // Non-owning (owned by factory).
+  Ort::Logger logger_;
+
+  // Tracks allocated buffers for ownership management.
+  // Key: iree_hal_buffer_t* (the value returned by Alloc)
+  // Value: RAII wrapper that releases buffer on destruction.
+  // TODO(thread-safety): Add std::mutex for thread-safe access.
+  std::unordered_map<void*, HalBufferPtr> allocations_;
+};
+
+}  // namespace iree_onnx_ep
+
+#endif  // IREE_ONNX_EP_SRC_IREE_ALLOCATOR_H_
