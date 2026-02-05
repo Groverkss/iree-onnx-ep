@@ -1,16 +1,106 @@
 #!/usr/bin/env python3
-"""Test initializer handling: small (inline) vs large (IRPA parameter)."""
+"""Test initializer handling: small inline, large IRPA parameter, and external."""
 
 import glob
 import os
-import pathlib
 import sys
 import tempfile
 
 import numpy as np
+import onnx
 from onnx import TensorProto, helper
+from onnx.external_data_helper import set_external_data
+from onnx.numpy_helper import from_array
 
 import test_utils
+
+# Fixed seed for reproducibility.
+np.random.seed(42)
+
+# Test data. Three initializers, each handled differently:
+#   D_small: [1, 64] float32 = 256 bytes  -> inline dense_resource
+#   D_large: [64, 64] float32 = 16384 bytes -> IRPA parameter
+#   D_ext:   [64, 64] float32 = 16384 bytes -> external file (not in IRPA)
+# Graph: C = ((A + D_small) + D_large) + D_ext
+SHAPE = [64, 64]
+A_DATA = np.random.rand(*SHAPE).astype(np.float32)
+B_SMALL = np.random.rand(1, 64).astype(np.float32)
+B_LARGE = np.random.rand(*SHAPE).astype(np.float32)
+B_EXT = np.random.rand(*SHAPE).astype(np.float32)
+EXPECTED = ((A_DATA + B_SMALL) + B_LARGE) + B_EXT
+
+
+def create_model():
+    """Create the test model and return (model_path, model_dir).
+
+    Caller must clean up model_dir when done.
+    """
+    const_small = helper.make_node(
+        "Constant",
+        inputs=[],
+        outputs=["D_small"],
+        value=helper.make_tensor(
+            name="small_const",
+            data_type=TensorProto.FLOAT,
+            dims=[1, 64],
+            vals=B_SMALL.flatten().tolist(),
+        ),
+    )
+    const_large = helper.make_node(
+        "Constant",
+        inputs=[],
+        outputs=["D_large"],
+        value=helper.make_tensor(
+            name="large_const",
+            data_type=TensorProto.FLOAT,
+            dims=SHAPE,
+            vals=B_LARGE.flatten().tolist(),
+        ),
+    )
+
+    # D_ext is a graph initializer backed by an external .bin file.
+    model_dir = tempfile.mkdtemp()
+    ext_data_filename = "ext_weights.bin"
+    ext_data_path = os.path.join(model_dir, ext_data_filename)
+
+    ext_tensor = from_array(B_EXT, name="D_ext")
+    raw_data = ext_tensor.raw_data
+    with open(ext_data_path, "wb") as f:
+        f.write(raw_data)
+    set_external_data(ext_tensor, location=ext_data_filename, length=len(raw_data))
+    ext_tensor.ClearField("raw_data")
+    ext_tensor.data_location = TensorProto.EXTERNAL
+
+    input_a = helper.make_tensor_value_info("A", TensorProto.FLOAT, SHAPE)
+    output = helper.make_tensor_value_info("C", TensorProto.FLOAT, SHAPE)
+
+    add1 = helper.make_node("Add", inputs=["A", "D_small"], outputs=["T1"])
+    add2 = helper.make_node("Add", inputs=["T1", "D_large"], outputs=["T2"])
+    add3 = helper.make_node("Add", inputs=["T2", "D_ext"], outputs=["C"])
+
+    graph = helper.make_graph(
+        [add1, add2, add3, const_small, const_large],
+        "test_graph",
+        [input_a],
+        [output],
+        initializer=[ext_tensor],
+    )
+    model = helper.make_model(
+        graph,
+        producer_name="iree_test",
+        opset_imports=[helper.make_opsetid("", 17)],
+    )
+    model.ir_version = 8
+
+    model_path = os.path.join(model_dir, "model.onnx")
+    onnx.save(model, model_path)
+    return model_path, model_dir
+
+
+def cleanup_model_dir(model_dir):
+    for f in os.listdir(model_dir):
+        os.remove(os.path.join(model_dir, f))
+    os.rmdir(model_dir)
 
 
 def get_iree_files():
@@ -21,68 +111,47 @@ def get_iree_files():
     return mlir, irpa
 
 
-def cleanup_files(files):
-    """Remove a set of files."""
-    for f in files:
+def cleanup_iree_files(new_mlir, new_irpa):
+    """Remove IREE temp files (MLIR, IRPA, VMFB)."""
+    for f in new_mlir | new_irpa:
+        try:
+            os.remove(f)
+        except OSError:
+            pass
+    temp_dir = tempfile.gettempdir()
+    for f in glob.glob(os.path.join(temp_dir, "iree_ep_*.vmfb")):
         try:
             os.remove(f)
         except OSError:
             pass
 
 
-def test_small_initializer_inline():
-    """Small constant (16 bytes) should be inlined via dense_resource."""
-    print("\n=== test_small_initializer_inline ===")
+def test_with_save_intermediates():
+    """Run with save_intermediates=1 and validate MLIR, IRPA, and inference."""
+    print("\n=== test_with_save_intermediates ===")
 
     device = test_utils.get_iree_device()
     if not device:
         print("ERROR: IREE device not found")
         return False
 
-    # 2x2 float32 = 16 bytes, well under 256 threshold.
-    a = np.array([[1, 2], [3, 4]], dtype=np.float32)
-    b = np.array([[10, 20], [30, 40]], dtype=np.float32)
-
-    input_a = helper.make_tensor_value_info("A", TensorProto.FLOAT, [2, 2])
-    output = helper.make_tensor_value_info("C", TensorProto.FLOAT, [2, 2])
-    constant_node = helper.make_node(
-        "Constant",
-        inputs=[],
-        outputs=["D"],
-        value=helper.make_tensor(
-            name="const_tensor",
-            data_type=TensorProto.FLOAT,
-            dims=[2, 2],
-            vals=b.flatten().tolist(),
-        ),
-    )
-    add_node = helper.make_node("Add", inputs=["A", "D"], outputs=["C"])
-    graph = helper.make_graph(
-        [add_node, constant_node], "test_graph", [input_a], [output]
-    )
-    model = helper.make_model(
-        graph,
-        producer_name="iree_test",
-        opset_imports=[helper.make_opsetid("", 17)],
-    )
-    model.ir_version = 8
-
+    model_path, model_dir = create_model()
     mlir_before, irpa_before = get_iree_files()
-    model_path = test_utils.save_model(model)
 
     try:
         session = test_utils.create_session(
-            model_path, device, {"target_arch": "host", "save_intermediates": "1"}
+            model_path,
+            device,
+            {"target_arch": "host", "save_intermediates": "1"},
         )
-        result = session.run(None, {"A": a})[0]
-        expected = a + b
+        result = session.run(None, {"A": A_DATA})[0]
 
-        if not np.allclose(result, expected, rtol=1e-5, atol=1e-5):
-            print(f"FAIL: Values mismatch\n  Expected: {expected}\n  Got: {result}")
+        if not np.allclose(result, EXPECTED, rtol=1e-5, atol=1e-5):
+            print("FAIL: Values mismatch")
             return False
         print("  Inference result correct")
 
-        # Check MLIR content.
+        # Validate generated MLIR.
         mlir_after, irpa_after = get_iree_files()
         new_mlir = mlir_after - mlir_before
         new_irpa = irpa_after - irpa_before
@@ -93,369 +162,81 @@ def test_small_initializer_inline():
 
         mlir_content = open(list(new_mlir)[0]).read()
 
-        if "dense_resource<" not in mlir_content:
-            print("FAIL: MLIR should contain dense_resource<")
-            return False
-        if "dialect_resources" not in mlir_content:
-            print("FAIL: MLIR should contain dialect_resources section")
-            return False
-        if "flow.parameter.named" in mlir_content:
-            print("FAIL: MLIR should NOT contain flow.parameter.named for small init")
-            return False
-        print("  MLIR content verified (inline dense_resource)")
-
-        # IRPA should exist but be empty (no parameters needed).
-        if new_irpa:
-            irpa_size = os.path.getsize(list(new_irpa)[0])
-            if irpa_size > 0:
-                print(f"FAIL: IRPA file should be empty, got {irpa_size} bytes")
-                return False
-            print(f"  IRPA file empty as expected")
-
-        cleanup_files(new_mlir | new_irpa)
-        # Also clean up VMFB files.
-        temp_dir = tempfile.gettempdir()
-        vmfb_after = set(glob.glob(os.path.join(temp_dir, "iree_ep_*.vmfb")))
-        cleanup_files(vmfb_after)
-
-        print("PASS")
-        return True
-    finally:
-        pathlib.Path(model_path).unlink()
-
-
-def test_large_initializer_parameter():
-    """Large constant (16384 bytes) should use IRPA parameter."""
-    print("\n=== test_large_initializer_parameter ===")
-
-    device = test_utils.get_iree_device()
-    if not device:
-        print("ERROR: IREE device not found")
-        return False
-
-    # 64x64 float32 = 16384 bytes, well over 256 threshold.
-    a = np.random.rand(64, 64).astype(np.float32)
-    b = np.random.rand(64, 64).astype(np.float32)
-
-    input_a = helper.make_tensor_value_info("A", TensorProto.FLOAT, [64, 64])
-    output = helper.make_tensor_value_info("C", TensorProto.FLOAT, [64, 64])
-    constant_node = helper.make_node(
-        "Constant",
-        inputs=[],
-        outputs=["D"],
-        value=helper.make_tensor(
-            name="const_tensor",
-            data_type=TensorProto.FLOAT,
-            dims=[64, 64],
-            vals=b.flatten().tolist(),
-        ),
-    )
-    add_node = helper.make_node("Add", inputs=["A", "D"], outputs=["C"])
-    graph = helper.make_graph(
-        [add_node, constant_node], "test_graph", [input_a], [output]
-    )
-    model = helper.make_model(
-        graph,
-        producer_name="iree_test",
-        opset_imports=[helper.make_opsetid("", 17)],
-    )
-    model.ir_version = 8
-
-    mlir_before, irpa_before = get_iree_files()
-    model_path = test_utils.save_model(model)
-
-    try:
-        session = test_utils.create_session(
-            model_path, device, {"target_arch": "host", "save_intermediates": "1"}
-        )
-        result = session.run(None, {"A": a})[0]
-        expected = a + b
-
-        if not np.allclose(result, expected, rtol=1e-5, atol=1e-5):
-            print(f"FAIL: Values mismatch")
-            return False
-        print("  Inference result correct")
-
-        # Check MLIR content.
-        mlir_after, irpa_after = get_iree_files()
-        new_mlir = mlir_after - mlir_before
-        new_irpa = irpa_after - irpa_before
-
-        if not new_mlir:
-            print("FAIL: No MLIR file saved")
-            return False
-
-        mlir_content = open(list(new_mlir)[0]).read()
-
-        if 'flow.parameter.named<"model"::' not in mlir_content:
-            print("FAIL: MLIR should contain flow.parameter.named")
-            return False
-        if "dense_resource<" in mlir_content:
-            print("FAIL: MLIR should NOT contain dense_resource< for large init")
-            return False
-        if "dialect_resources" in mlir_content:
-            print("FAIL: MLIR should NOT contain dialect_resources for large init")
-            return False
-        print("  MLIR content verified (parameter reference)")
-
-        # IRPA should exist and have content.
-        if not new_irpa:
-            print("FAIL: No IRPA file was created")
-            return False
-        irpa_size = os.path.getsize(list(new_irpa)[0])
-        if irpa_size == 0:
-            print("FAIL: IRPA file should not be empty")
-            return False
-        print(f"  IRPA file size: {irpa_size} bytes")
-
-        cleanup_files(new_mlir | new_irpa)
-        temp_dir = tempfile.gettempdir()
-        vmfb_after = set(glob.glob(os.path.join(temp_dir, "iree_ep_*.vmfb")))
-        cleanup_files(vmfb_after)
-
-        print("PASS")
-        return True
-    finally:
-        pathlib.Path(model_path).unlink()
-
-
-def test_mixed_initializers():
-    """Model with both small and large constants."""
-    print("\n=== test_mixed_initializers ===")
-
-    device = test_utils.get_iree_device()
-    if not device:
-        print("ERROR: IREE device not found")
-        return False
-
-    # Small: 1x16 float32 = 64 bytes (inline, broadcasts to [16,16]).
-    # Large: 16x16 float32 = 1024 bytes (parameter).
-    # Graph: C = (A + D_small) + D_large
-    shape = [16, 16]
-    a = np.random.rand(*shape).astype(np.float32)
-    b_small = np.random.rand(1, 16).astype(np.float32)
-    b_large = np.random.rand(*shape).astype(np.float32)
-
-    input_a = helper.make_tensor_value_info("A", TensorProto.FLOAT, shape)
-    output = helper.make_tensor_value_info("C", TensorProto.FLOAT, shape)
-
-    const_small = helper.make_node(
-        "Constant",
-        inputs=[],
-        outputs=["D_small"],
-        value=helper.make_tensor(
-            name="small_const",
-            data_type=TensorProto.FLOAT,
-            dims=[1, 16],
-            vals=b_small.flatten().tolist(),
-        ),
-    )
-    const_large = helper.make_node(
-        "Constant",
-        inputs=[],
-        outputs=["D_large"],
-        value=helper.make_tensor(
-            name="large_const",
-            data_type=TensorProto.FLOAT,
-            dims=shape,
-            vals=b_large.flatten().tolist(),
-        ),
-    )
-
-    add1_out = helper.make_tensor_value_info("T", TensorProto.FLOAT, shape)
-    add1 = helper.make_node("Add", inputs=["A", "D_small"], outputs=["T"])
-    add2 = helper.make_node("Add", inputs=["T", "D_large"], outputs=["C"])
-
-    graph = helper.make_graph(
-        [add1, add2, const_small, const_large],
-        "test_graph",
-        [input_a],
-        [output],
-    )
-    model = helper.make_model(
-        graph,
-        producer_name="iree_test",
-        opset_imports=[helper.make_opsetid("", 17)],
-    )
-    model.ir_version = 8
-
-    mlir_before, irpa_before = get_iree_files()
-    model_path = test_utils.save_model(model)
-
-    try:
-        session = test_utils.create_session(
-            model_path, device, {"target_arch": "host", "save_intermediates": "1"}
-        )
-        result = session.run(None, {"A": a})[0]
-        expected = (a + b_small) + b_large
-
-        if not np.allclose(result, expected, rtol=1e-5, atol=1e-5):
-            print(f"FAIL: Values mismatch")
-            return False
-        print("  Inference result correct")
-
-        # Check MLIR content.
-        mlir_after, irpa_after = get_iree_files()
-        new_mlir = mlir_after - mlir_before
-        new_irpa = irpa_after - irpa_before
-
-        if not new_mlir:
-            print("FAIL: No MLIR file saved")
-            return False
-
-        mlir_content = open(list(new_mlir)[0]).read()
-
+        # D_small should be inlined via dense_resource.
         if "dense_resource<" not in mlir_content:
             print("FAIL: MLIR should contain dense_resource< for small init")
             return False
-        if 'flow.parameter.named<"model"::' not in mlir_content:
-            print("FAIL: MLIR should contain flow.parameter.named for large init")
-            return False
         if "dialect_resources" not in mlir_content:
             print("FAIL: MLIR should contain dialect_resources section")
             return False
-        print("  MLIR content verified (both inline and parameter)")
+        print("  Small init: dense_resource + dialect_resources present")
 
-        # IRPA should exist and have content.
+        # D_large and D_ext should use flow.parameter.named.
+        if 'flow.parameter.named<"model"::' not in mlir_content:
+            print("FAIL: MLIR should contain flow.parameter.named")
+            return False
+        print("  Large/external inits: flow.parameter.named present")
+
+        # IRPA should contain only D_large's data (16384 bytes + header),
+        # not D_ext's. If D_ext were copied it would be >32000 bytes.
         if not new_irpa:
             print("FAIL: No IRPA file was created")
             return False
         irpa_size = os.path.getsize(list(new_irpa)[0])
         if irpa_size == 0:
-            print("FAIL: IRPA file should not be empty")
+            print("FAIL: IRPA should contain D_large data")
             return False
-        print(f"  IRPA file size: {irpa_size} bytes")
+        if irpa_size > 20000:
+            print(
+                f"FAIL: IRPA too large ({irpa_size} bytes), "
+                f"external data may have been copied"
+            )
+            return False
+        print(f"  IRPA size: {irpa_size} bytes (D_large only, D_ext not copied)")
 
-        cleanup_files(new_mlir | new_irpa)
-        temp_dir = tempfile.gettempdir()
-        vmfb_after = set(glob.glob(os.path.join(temp_dir, "iree_ep_*.vmfb")))
-        cleanup_files(vmfb_after)
-
+        cleanup_iree_files(new_mlir, new_irpa)
         print("PASS")
         return True
     finally:
-        pathlib.Path(model_path).unlink()
+        cleanup_model_dir(model_dir)
 
 
-def test_small_initializer_no_save():
-    """Small constant without save_intermediates — verify inference works."""
-    print("\n=== test_small_initializer_no_save ===")
+def test_without_save_intermediates():
+    """Run without save_intermediates and validate inference."""
+    print("\n=== test_without_save_intermediates ===")
 
     device = test_utils.get_iree_device()
     if not device:
         print("ERROR: IREE device not found")
         return False
 
-    a = np.array([[1, 2], [3, 4]], dtype=np.float32)
-    b = np.array([[10, 20], [30, 40]], dtype=np.float32)
+    model_path, model_dir = create_model()
 
-    input_a = helper.make_tensor_value_info("A", TensorProto.FLOAT, [2, 2])
-    output = helper.make_tensor_value_info("C", TensorProto.FLOAT, [2, 2])
-    constant_node = helper.make_node(
-        "Constant",
-        inputs=[],
-        outputs=["D"],
-        value=helper.make_tensor(
-            name="const_tensor",
-            data_type=TensorProto.FLOAT,
-            dims=[2, 2],
-            vals=b.flatten().tolist(),
-        ),
-    )
-    add_node = helper.make_node("Add", inputs=["A", "D"], outputs=["C"])
-    graph = helper.make_graph(
-        [add_node, constant_node], "test_graph", [input_a], [output]
-    )
-    model = helper.make_model(
-        graph,
-        producer_name="iree_test",
-        opset_imports=[helper.make_opsetid("", 17)],
-    )
-    model.ir_version = 8
-
-    model_path = test_utils.save_model(model)
     try:
         session = test_utils.create_session(model_path, device, {"target_arch": "host"})
-        result = session.run(None, {"A": a})[0]
-        expected = a + b
+        result = session.run(None, {"A": A_DATA})[0]
 
-        if not np.allclose(result, expected, rtol=1e-5, atol=1e-5):
-            print(f"FAIL: Values mismatch\n  Expected: {expected}\n  Got: {result}")
+        if not np.allclose(result, EXPECTED, rtol=1e-5, atol=1e-5):
+            print("FAIL: Values mismatch")
             return False
 
         print("  Inference result correct")
         print("PASS")
         return True
     finally:
-        pathlib.Path(model_path).unlink()
-
-
-def test_large_initializer_no_save():
-    """Large constant without save_intermediates — verify inference works."""
-    print("\n=== test_large_initializer_no_save ===")
-
-    device = test_utils.get_iree_device()
-    if not device:
-        print("ERROR: IREE device not found")
-        return False
-
-    a = np.random.rand(64, 64).astype(np.float32)
-    b = np.random.rand(64, 64).astype(np.float32)
-
-    input_a = helper.make_tensor_value_info("A", TensorProto.FLOAT, [64, 64])
-    output = helper.make_tensor_value_info("C", TensorProto.FLOAT, [64, 64])
-    constant_node = helper.make_node(
-        "Constant",
-        inputs=[],
-        outputs=["D"],
-        value=helper.make_tensor(
-            name="const_tensor",
-            data_type=TensorProto.FLOAT,
-            dims=[64, 64],
-            vals=b.flatten().tolist(),
-        ),
-    )
-    add_node = helper.make_node("Add", inputs=["A", "D"], outputs=["C"])
-    graph = helper.make_graph(
-        [add_node, constant_node], "test_graph", [input_a], [output]
-    )
-    model = helper.make_model(
-        graph,
-        producer_name="iree_test",
-        opset_imports=[helper.make_opsetid("", 17)],
-    )
-    model.ir_version = 8
-
-    model_path = test_utils.save_model(model)
-    try:
-        session = test_utils.create_session(model_path, device, {"target_arch": "host"})
-        result = session.run(None, {"A": a})[0]
-        expected = a + b
-
-        if not np.allclose(result, expected, rtol=1e-5, atol=1e-5):
-            print(f"FAIL: Values mismatch")
-            return False
-
-        print("  Inference result correct")
-        print("PASS")
-        return True
-    finally:
-        pathlib.Path(model_path).unlink()
+        cleanup_model_dir(model_dir)
 
 
 def main():
     """Run all initializer tests."""
-    print("Testing initializer handling (inline vs IRPA parameter)")
+    print("Testing initializer handling (inline, IRPA parameter, external)")
     print("=" * 60)
 
     test_utils.register_ep()
 
     results = []
-    results.append(("small_inline", test_small_initializer_inline()))
-    results.append(("large_parameter", test_large_initializer_parameter()))
-    results.append(("mixed", test_mixed_initializers()))
-    results.append(("small_no_save", test_small_initializer_no_save()))
-    results.append(("large_no_save", test_large_initializer_no_save()))
+    results.append(("with_save_intermediates", test_with_save_intermediates()))
+    results.append(("without_save_intermediates", test_without_save_intermediates()))
 
     print("\n" + "=" * 60)
     print("Summary:")

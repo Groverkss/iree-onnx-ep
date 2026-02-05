@@ -4,6 +4,7 @@
 
 #include <cassert>
 #include <cstdint>
+#include <filesystem>
 #include <format>
 #include <fstream>
 #include <sstream>
@@ -651,7 +652,10 @@ OrtStatus* MlirGenerator::BuildParameterArchive(
     }
 
     FileHandlePtr ext_handle;
-    std::string filepath = ext_info.GetFilePath();
+    // External data paths are relative to the model directory.
+    std::filesystem::path model_dir =
+        std::filesystem::path(graph_.GetModelPath()).parent_path();
+    std::string filepath = (model_dir / ext_info.GetFilePath()).string();
     IREE_ORT_RETURN_IF_ERROR(iree_io_file_handle_open(
         IREE_IO_FILE_MODE_READ,
         iree_make_string_view(filepath.data(), filepath.size()), allocator,
