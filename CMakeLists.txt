@@ -149,8 +149,14 @@ add_library(iree_onnx_ep SHARED
   src/temp_file.cc
 )
 
-# Statically link IREE runtime
-target_link_libraries(iree_onnx_ep PRIVATE iree_runtime_unified)
+# Statically link IREE runtime and io/parameter libraries.
+target_link_libraries(iree_onnx_ep PRIVATE
+  iree_runtime_unified
+  iree_io_parameter_index
+  iree_io_parameter_index_provider
+  iree_io_formats_irpa_irpa
+  iree_modules_io_parameters_parameters
+)
 
 
 # Include directories

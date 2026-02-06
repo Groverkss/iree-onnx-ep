@@ -4,18 +4,46 @@
 
 #include <cassert>
 #include <cstdint>
+#include <filesystem>
 #include <format>
 #include <fstream>
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
+#include "iree/io/file_handle.h"
+#include "iree/io/formats/irpa/irpa_builder.h"
+#include "iree/io/parameter_index.h"
+#include "iree/io/parameter_index_provider.h"
 #include "iree_ort_utils.h"
 
 namespace iree_onnx_ep {
 namespace {
+
+// Initializers smaller than this are inlined via dense_resource + dialect
+// resources. Larger ones become IREE parameters backed by an IRPA archive.
+constexpr size_t kMaxInlineInitializerSize = 256;
+
+// Tracks a large initializer that will become an IREE parameter.
+struct ParameterInitializer {
+  std::string sanitized_name;
+  size_t initializer_index;  // Index into initializers_ vector.
+};
+
+// Callback for iree_io_build_parameter_archive to create the IRPA file.
+iree_status_t IrpaFileOpenCallback(void* user_data, iree_io_physical_offset_t,
+                                   iree_io_physical_size_t,
+                                   iree_io_file_handle_t** out_file_handle) {
+  auto* path = static_cast<const std::string*>(user_data);
+  return iree_io_file_handle_open(
+      IREE_IO_FILE_MODE_READ | IREE_IO_FILE_MODE_WRITE |
+          IREE_IO_FILE_MODE_OVERWRITE,
+      iree_make_string_view(path->data(), path->size()),
+      iree_allocator_system(), out_file_handle);
+}
 
 // Sanitizes an ONNX name to be a valid MLIR SSA identifier.
 // MLIR identifiers must match [a-zA-Z_][a-zA-Z0-9_$]*.
@@ -143,8 +171,9 @@ std::string FormatMlirTensorType(const Ort::ConstTypeInfo& type_info) {
 // MLIR generator class.
 class MlirGenerator {
  public:
-  MlirGenerator(const Ort::ConstGraph& graph, std::ostream& out)
-      : graph_(graph), out_(out) {}
+  MlirGenerator(const Ort::ConstGraph& graph, std::ostream& out,
+                const std::string& irpa_path)
+      : graph_(graph), out_(out), irpa_path_(irpa_path) {}
 
   void Generate() {
     CollectMetadata();
@@ -152,6 +181,12 @@ class MlirGenerator {
     EmitFunctionBody();
     EmitModuleFooter();
   }
+
+  // Builds an IRPA parameter archive for large initializers and creates a
+  // parameter provider. Call after Generate(). If no parameters are needed,
+  // the output pointers remain null.
+  OrtStatus* BuildParameterArchive(ParameterIndexPtr& out_index,
+                                   ParameterProviderPtr& out_provider);
 
  private:
   void CollectMetadata() {
@@ -238,9 +273,9 @@ class MlirGenerator {
   }
 
   void EmitFunctionBody() {
-    // Emit initializers as onnx.Constant ops.
-    for (const auto& init : initializers_) {
-      EmitInitializer(init);
+    // Emit initializers as flow.tensor.constant ops.
+    for (size_t i = 0; i < initializers_.size(); ++i) {
+      EmitInitializer(initializers_[i], i);
     }
 
     // Emit nodes.
@@ -253,25 +288,47 @@ class MlirGenerator {
     EmitReturn();
   }
 
-  // Emits an initializer as an onnx.Constant operation with a dense_resource
-  // attribute. The actual tensor data is not emitted here; instead, a reference
-  // to a named resource blob is emitted. The blob data is emitted later in the
-  // dialect_resources section by EmitDialectResources().
+  // Emits an initializer as a flow.tensor.constant with a
+  // torch_c.from_builtin_tensor cast. Small initializers use dense_resource
+  // (data emitted later in dialect_resources). Large initializers use
+  // #flow.parameter.named (data stored in IRPA archive).
   //
-  // Output format:
-  //   %name = torch.operator "onnx.Constant"()
-  //       {torch.onnx.value = dense_resource<name> : tensor<...>}
-  //       : () -> !torch.vtensor<[...],dtype>
-  void EmitInitializer(const Ort::ConstValueInfo& init) {
+  // Output format (small):
+  //   %__raw_name = flow.tensor.constant dense_resource<name> : tensor<...>
+  //   %name = torch_c.from_builtin_tensor %__raw_name : tensor<...>
+  //       -> !torch.vtensor<[...],dtype>
+  //
+  // Output format (large):
+  //   %__raw_name = flow.tensor.constant
+  //       #flow.parameter.named<"model"::"name"> : tensor<...>
+  //   %name = torch_c.from_builtin_tensor %__raw_name : tensor<...>
+  //       -> !torch.vtensor<[...],dtype>
+  void EmitInitializer(const Ort::ConstValueInfo& init, size_t init_index) {
     std::string name = SanitizeName(init.GetName());
     std::string vtensor_type = FormatTensorType(init.TypeInfo());
     std::string tensor_type = FormatMlirTensorType(init.TypeInfo());
 
-    // Emit dense_resource reference. Data will be emitted in dialect_resources.
-    constexpr std::string_view schema =
-        R"(    %{0} = torch.operator "onnx.Constant"() {{torch.onnx.value = dense_resource<{0}> : {1}}} : () -> {2}
+    auto tensor_info = init.TypeInfo().GetTensorTypeAndShapeInfo();
+    size_t byte_size = tensor_info.GetElementCount() *
+                       OnnxElementTypeSize(tensor_info.GetElementType());
+
+    if (byte_size <= kMaxInlineInitializerSize) {
+      // Small: inline with dense_resource. Data emitted in dialect_resources.
+      constexpr std::string_view schema =
+          R"(    %__raw_{0} = flow.tensor.constant dense_resource<{0}> : {1}
+    %{0} = torch_c.from_builtin_tensor %__raw_{0} : {1} -> {2}
 )";
-    out_ << std::format(schema, name, tensor_type, vtensor_type);
+      out_ << std::format(schema, name, tensor_type, vtensor_type);
+      inline_initializers_.insert(name);
+    } else {
+      // Large: parameter reference. Data stored in IRPA archive.
+      constexpr std::string_view schema =
+          R"(    %__raw_{0} = flow.tensor.constant #flow.parameter.named<"model"::"{0}"> : {1}
+    %{0} = torch_c.from_builtin_tensor %__raw_{0} : {1} -> {2}
+)";
+      out_ << std::format(schema, name, tensor_type, vtensor_type);
+      parameter_initializers_.push_back({name, init_index});
+    }
   }
 
   void EmitNode(const Ort::ConstNode& node) {
@@ -404,7 +461,7 @@ class MlirGenerator {
   //     }
   //   #-}
   void EmitDialectResources() {
-    if (initializers_.empty()) {
+    if (inline_initializers_.empty()) {
       return;
     }
 
@@ -417,13 +474,19 @@ class MlirGenerator {
 
     bool first = true;
     for (const auto& init : initializers_) {
+      std::string name = SanitizeName(init.GetName());
+
+      // Only emit data for small inline initializers.
+      if (inline_initializers_.find(name) == inline_initializers_.end()) {
+        continue;
+      }
+
       Ort::ConstValue tensor_value{nullptr};
       auto status = init.GetInitializer(tensor_value);
       if (!status.IsOK()) {
         continue;
       }
 
-      std::string name = SanitizeName(init.GetName());
       const auto* data =
           static_cast<const uint8_t*>(tensor_value.GetTensorRawData());
       size_t size = tensor_value.GetTensorSizeInBytes();
@@ -479,6 +542,7 @@ class MlirGenerator {
   // Member variables.
   const Ort::ConstGraph& graph_;
   std::ostream& out_;
+  std::string irpa_path_;
 
   std::string graph_name_;
   int64_t ir_version_ = 8;
@@ -487,33 +551,165 @@ class MlirGenerator {
   std::vector<Ort::ConstValueInfo> graph_inputs_;
   std::vector<Ort::ConstValueInfo> graph_outputs_;
   std::vector<Ort::ConstValueInfo> initializers_;
+  std::unordered_set<std::string> inline_initializers_;
+  std::vector<ParameterInitializer> parameter_initializers_;
 };
+
+// Builds an IRPA parameter archive for large initializers.
+//
+// Large inline initializers are copied into an IRPA (IREE Parameter Archive)
+// file on disk. We write to an IRPA file rather than keeping data in memory
+// because ORT does not guarantee that initializer tensor data remains valid
+// beyond the Compile() call. By persisting to disk via IRPA, the data is
+// accessed at runtime through IREE's parameter index with file-backed entries.
+//
+// External initializers (already backed by external files) are added to the
+// parameter index directly, pointing to their original files without copying.
+//
+// The resulting parameter provider is registered with the IREE session so that
+// the compiled module can resolve #flow.parameter.named references at runtime.
+OrtStatus* MlirGenerator::BuildParameterArchive(
+    ParameterIndexPtr& out_index, ParameterProviderPtr& out_provider) {
+  if (parameter_initializers_.empty()) {
+    return nullptr;
+  }
+
+  iree_allocator_t allocator = iree_allocator_system();
+
+  // Build source index from ORT tensor data wrapped as file handles.
+  // The tensor data is valid for the duration of this call (we are inside
+  // CompileImpl). iree_io_build_parameter_archive copies it to the IRPA file.
+  ParameterIndexPtr source_index;
+  IREE_ORT_RETURN_IF_ERROR(
+      iree_io_parameter_index_create(allocator, source_index.ForOutput()));
+
+  for (const auto& param : parameter_initializers_) {
+    const auto& init = initializers_[param.initializer_index];
+
+    // Skip external initializers — added to target index later.
+    // Note: GetExternalInitializerInfo returns OK with null output for
+    // non-external initializers, so we must check both status and pointer.
+    Ort::ExternalInitializerInfo ext_info(nullptr);
+    ORT_RETURN_IF_ERROR(init.GetExternalInitializerInfo(ext_info).release());
+    if (ext_info) {
+      continue;
+    }
+
+    Ort::ConstValue tensor(nullptr);
+    auto status = init.GetInitializer(tensor);
+    if (!status.IsOK()) {
+      return Ort::Status(
+                 std::format("Failed to get initializer: {}", init.GetName())
+                     .c_str(),
+                 ORT_FAIL)
+          .release();
+    }
+
+    auto* data = const_cast<uint8_t*>(
+        static_cast<const uint8_t*>(tensor.GetTensorRawData()));
+    size_t size = tensor.GetTensorSizeInBytes();
+
+    FileHandlePtr handle;
+    iree_byte_span_t span = {data, static_cast<iree_host_size_t>(size)};
+    IREE_ORT_RETURN_IF_ERROR(iree_io_file_handle_wrap_host_allocation(
+        IREE_IO_FILE_ACCESS_READ, span,
+        iree_io_file_handle_release_callback_null(), allocator,
+        handle.ForOutput()));
+
+    iree_io_parameter_index_entry_t entry = {};
+    entry.key = iree_make_string_view(param.sanitized_name.data(),
+                                      param.sanitized_name.size());
+    entry.length = size;
+    entry.type = IREE_IO_PARAMETER_INDEX_ENTRY_STORAGE_TYPE_FILE;
+    entry.storage.file.handle = handle.Get();
+    entry.storage.file.offset = 0;
+    IREE_ORT_RETURN_IF_ERROR(
+        iree_io_parameter_index_add(source_index.Get(), &entry));
+  }
+
+  // Build IRPA archive from source index.
+  ParameterIndexPtr target_index;
+  IREE_ORT_RETURN_IF_ERROR(
+      iree_io_parameter_index_create(allocator, target_index.ForOutput()));
+
+  if (iree_io_parameter_index_count(source_index.Get()) > 0) {
+    iree_io_parameter_archive_file_open_callback_t file_open = {
+        IrpaFileOpenCallback,
+        const_cast<std::string*>(&irpa_path_),
+    };
+    IREE_ORT_RETURN_IF_ERROR(iree_io_build_parameter_archive(
+        source_index.Get(), target_index.Get(), file_open, 0, allocator));
+  }
+
+  // Add external initializer entries directly to target index.
+  for (const auto& param : parameter_initializers_) {
+    const auto& init = initializers_[param.initializer_index];
+
+    Ort::ExternalInitializerInfo ext_info(nullptr);
+    ORT_RETURN_IF_ERROR(init.GetExternalInitializerInfo(ext_info).release());
+    if (!ext_info) {
+      continue;
+    }
+
+    FileHandlePtr ext_handle;
+    // External data paths are relative to the model directory.
+    std::filesystem::path model_dir =
+        std::filesystem::path(graph_.GetModelPath()).parent_path();
+    std::string filepath = (model_dir / ext_info.GetFilePath()).string();
+    IREE_ORT_RETURN_IF_ERROR(iree_io_file_handle_open(
+        IREE_IO_FILE_MODE_READ,
+        iree_make_string_view(filepath.data(), filepath.size()), allocator,
+        ext_handle.ForOutput()));
+
+    iree_io_parameter_index_entry_t entry = {};
+    entry.key = iree_make_string_view(param.sanitized_name.data(),
+                                      param.sanitized_name.size());
+    entry.length = ext_info.GetByteSize();
+    entry.type = IREE_IO_PARAMETER_INDEX_ENTRY_STORAGE_TYPE_FILE;
+    entry.storage.file.handle = ext_handle.Get();
+    entry.storage.file.offset = static_cast<uint64_t>(ext_info.GetFileOffset());
+    IREE_ORT_RETURN_IF_ERROR(
+        iree_io_parameter_index_add(target_index.Get(), &entry));
+  }
+
+  ParameterProviderPtr provider;
+  IREE_ORT_RETURN_IF_ERROR(iree_io_parameter_index_provider_create(
+      iree_make_cstring_view("model"), target_index.Get(),
+      IREE_IO_PARAMETER_INDEX_PROVIDER_DEFAULT_MAX_CONCURRENT_OPERATIONS,
+      allocator, provider.ForOutput()));
+
+  out_index = std::move(target_index);
+  out_provider = std::move(provider);
+  return nullptr;
+}
 
 }  // namespace
 
 OrtStatus* GenerateMlir(const Ort::ConstGraph& graph, const OrtApi& /*ort_api*/,
-                        const std::string& output_path) {
-  std::ofstream file(output_path);
+                        const std::string& mlir_path,
+                        const std::string& irpa_path,
+                        ParameterIndexPtr& out_index,
+                        ParameterProviderPtr& out_provider) {
+  std::ofstream file(mlir_path);
   if (!file.is_open()) {
     return Ort::Status(
-               std::format("Failed to open output file: {}", output_path)
-                   .c_str(),
+               std::format("Failed to open output file: {}", mlir_path).c_str(),
                ORT_FAIL)
         .release();
   }
 
-  MlirGenerator gen(graph, file);
+  MlirGenerator gen(graph, file, irpa_path);
   gen.Generate();
 
   file.close();
   if (file.fail()) {
     return Ort::Status(
-               std::format("Failed to write to file: {}", output_path).c_str(),
+               std::format("Failed to write to file: {}", mlir_path).c_str(),
                ORT_FAIL)
         .release();
   }
 
-  return nullptr;
+  return gen.BuildParameterArchive(out_index, out_provider);
 }
 
 }  // namespace iree_onnx_ep

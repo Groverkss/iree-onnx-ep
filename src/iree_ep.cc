@@ -7,6 +7,7 @@
 
 #include <vector>
 
+#include "iree/modules/io/parameters/module.h"
 #include "iree/runtime/api.h"
 #include "iree_compile.h"
 #include "iree_ep_factory.h"
@@ -140,25 +141,35 @@ OrtStatus* ORT_API_CALL IreeEp::CompileImpl(
   // Create temp files for intermediate artifacts.
   TempFile mlir_file(".mlir");
   TempFile vmfb_file(".vmfb");
+  TempFile irpa_file(".irpa");
 
   // If save_intermediates is enabled, mark files to be kept for debugging.
   if (ep->config_.save_intermediates) {
     mlir_file.Keep();
     vmfb_file.Keep();
+    irpa_file.Keep();
     ORT_CXX_LOGF_NOEXCEPT(ep->logger_, ORT_LOGGING_LEVEL_INFO,
                           "IREE EP: Saving MLIR to: %s",
                           mlir_file.Path().c_str());
     ORT_CXX_LOGF_NOEXCEPT(ep->logger_, ORT_LOGGING_LEVEL_INFO,
                           "IREE EP: Saving VMFB to: %s",
                           vmfb_file.Path().c_str());
+    ORT_CXX_LOGF_NOEXCEPT(ep->logger_, ORT_LOGGING_LEVEL_INFO,
+                          "IREE EP: Saving IRPA to: %s",
+                          irpa_file.Path().c_str());
   }
 
   // Phase 1: Generate MLIR from the first graph.
+  // Also builds an IRPA parameter archive for large initializers.
   // TODO: Do we need to handle multiple graphs?
   Ort::ConstGraph graph{graphs[0]};
+  ParameterIndexPtr parameter_index;
+  ParameterProviderPtr parameter_provider;
   ORT_CXX_LOG_NOEXCEPT(ep->logger_, ORT_LOGGING_LEVEL_INFO,
                        "IREE EP: Generating MLIR");
-  ORT_RETURN_IF_ERROR(GenerateMlir(graph, ep->ort_api, mlir_file.Path()));
+  ORT_RETURN_IF_ERROR(GenerateMlir(graph, ep->ort_api, mlir_file.Path(),
+                                   irpa_file.Path(), parameter_index,
+                                   parameter_provider));
   ORT_CXX_LOG_NOEXCEPT(ep->logger_, ORT_LOGGING_LEVEL_INFO,
                        "IREE EP: MLIR Generated Successfully");
 
@@ -182,14 +193,31 @@ OrtStatus* ORT_API_CALL IreeEp::CompileImpl(
       iree_runtime_instance_host_allocator(ep->factory_.IreeInstance()),
       session.ForOutput()));
 
-  // Phase 4: Load VMFB bytecode module.
+  // Phase 4: Register io_parameters module if we have parameters.
+  // The session retains the module, which retains the provider, which retains
+  // the index. No need to store these separately.
+  if (parameter_provider) {
+    ORT_CXX_LOG_NOEXCEPT(ep->logger_, ORT_LOGGING_LEVEL_INFO,
+                         "IREE EP: Registering parameter provider");
+    VmModulePtr parameters_module;
+    iree_io_parameter_provider_t* provider_raw = parameter_provider.Get();
+    IREE_ORT_RETURN_IF_ERROR(iree_io_parameters_module_create(
+        iree_runtime_instance_vm_instance(ep->factory_.IreeInstance()), 1,
+        &provider_raw,
+        iree_runtime_instance_host_allocator(ep->factory_.IreeInstance()),
+        parameters_module.ForOutput()));
+    IREE_ORT_RETURN_IF_ERROR(iree_runtime_session_append_module(
+        session.Get(), parameters_module.Get()));
+  }
+
+  // Phase 5: Load VMFB bytecode module.
   ORT_CXX_LOG_NOEXCEPT(ep->logger_, ORT_LOGGING_LEVEL_INFO,
                        "IREE EP: Loading VMFB module");
   IREE_ORT_RETURN_IF_ERROR(
       iree_runtime_session_append_bytecode_module_from_file(
           session.Get(), vmfb_file.Path().c_str()));
 
-  // Phase 5: Lookup the main function.
+  // Phase 6: Lookup the main function.
   // Function name format: "module.{graph_name}" (defaults to "main" if empty).
   std::string graph_name = graph.GetName();
   std::string function_name =

@@ -7,6 +7,9 @@
 
 #include <string>
 
+#include "iree/io/file_handle.h"
+#include "iree/io/parameter_index.h"
+#include "iree/io/parameter_provider.h"
 #include "iree/runtime/api.h"
 #include "ort_import.h"
 
@@ -145,6 +148,21 @@ using HalBufferViewPtr =
 
 using HalBufferPtr =
     IreePtr<iree_hal_buffer_t, iree_hal_buffer_retain, iree_hal_buffer_release>;
+
+// Type aliases for IREE IO / parameter types.
+using ParameterIndexPtr =
+    IreePtr<iree_io_parameter_index_t, iree_io_parameter_index_retain,
+            iree_io_parameter_index_release>;
+
+using ParameterProviderPtr =
+    IreePtr<iree_io_parameter_provider_t, iree_io_parameter_provider_retain,
+            iree_io_parameter_provider_release>;
+
+using FileHandlePtr = IreePtr<iree_io_file_handle_t, iree_io_file_handle_retain,
+                              iree_io_file_handle_release>;
+
+using VmModulePtr =
+    IreePtr<iree_vm_module_t, iree_vm_module_retain, iree_vm_module_release>;
 
 // Wrapper for iree_runtime_call_t (stack-allocated, needs deinitialize).
 class RuntimeCall {

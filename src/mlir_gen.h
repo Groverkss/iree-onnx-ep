@@ -17,14 +17,21 @@
 
 #include <string>
 
+#include "iree_wrappers.h"
 #include "ort_import.h"
 
 namespace iree_onnx_ep {
 
 // Generates MLIR text from an OrtGraph and writes it to the specified file.
-// Returns nullptr on success, or an OrtStatus with error details on failure.
+// Small initializers are inlined in the MLIR. Large initializers are emitted as
+// parameter references and their data is written to an IRPA archive at
+// irpa_path. out_index and out_provider are populated with the parameter index
+// and provider for the archive. They remain null if no parameters are needed.
 OrtStatus* GenerateMlir(const Ort::ConstGraph& graph, const OrtApi& ort_api,
-                        const std::string& output_path);
+                        const std::string& mlir_path,
+                        const std::string& irpa_path,
+                        ParameterIndexPtr& out_index,
+                        ParameterProviderPtr& out_provider);
 
 }  // namespace iree_onnx_ep
 

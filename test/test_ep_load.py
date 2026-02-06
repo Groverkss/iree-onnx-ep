@@ -3,56 +3,31 @@
 
 import pathlib
 import sys
-import tempfile
+
 import numpy as np
-import onnx
-from onnx import helper, TensorProto
-import onnxruntime as ort
-import iree_onnx_ep
+from onnx import TensorProto, helper
+
+import test_utils
 
 
 def test_ep_load():
     """Test that the IREE EP plugin loads and runs inference correctly."""
 
-    # Enable debug logging.
-    ort.set_default_logger_severity(0)
-
-    # Get the path to the built EP library
-    ep_lib_path = iree_onnx_ep.get_library_path()
-    print(f"EP library path: {ep_lib_path}")
-
-    # Register the EP plugin
-    ort.register_execution_provider_library(iree_onnx_ep.get_ep_name(), ep_lib_path)
-    print("EP plugin registered successfully")
-
-    # Get IREE device
-    iree_driver = "local-task"
-    ep_devices = ort.get_ep_devices()
-    print(ep_devices)
-    iree_device = None
-    for dev in ep_devices:
-        print(dev.device.metadata)
-        if dev.device.metadata.get("iree.driver") == iree_driver:
-            iree_device = dev
-            break
-
-    if not iree_device:
+    device = test_utils.get_iree_device("local-task")
+    if not device:
         print("ERROR: IREE EP not found in EP devices")
         return False
 
-    print(f"IREE EP available (vendor={iree_device.ep_vendor})")
-    print("Device metadata:", iree_device.device.metadata)
-    print("Device type:", iree_device.device.type)
+    print(f"IREE EP available (vendor={device.ep_vendor})")
+    print(f"  Device metadata: {device.device.metadata}")
+    print(f"  Device type: {device.device.type}")
 
-    a = np.array([[1, 2, 3, 4], [5, 6, 7, 8], [9, 10, 11, 12]], dtype=np.float32)
-    b = np.array(
-        [[10, 20, 30, 40], [50, 60, 70, 80], [90, 100, 110, 120]], dtype=np.float32
-    )
+    # Create a simple Add model: C = A + D (constant).
+    a = np.float32(np.random.rand(64, 64))
+    b = np.float32(np.random.rand(64, 64))
 
-    # Create a simple Add model
-    input_a = helper.make_tensor_value_info("A", TensorProto.FLOAT, [3, 4])
-    # input_b = helper.make_tensor_value_info('B', TensorProto.FLOAT, [3, 4])
-    output = helper.make_tensor_value_info("C", TensorProto.FLOAT, [3, 4])
+    input_a = helper.make_tensor_value_info("A", TensorProto.FLOAT, list(a.shape))
+    output = helper.make_tensor_value_info("C", TensorProto.FLOAT, list(b.shape))
     constant_node = helper.make_node(
         "Constant",
         inputs=[],
@@ -60,7 +35,7 @@ def test_ep_load():
         value=helper.make_tensor(
             name="const_tensor",
             data_type=TensorProto.FLOAT,
-            dims=[3, 4],
+            dims=list(b.shape),
             vals=b.flatten().tolist(),
         ),
     )
@@ -74,32 +49,14 @@ def test_ep_load():
     )
     model.ir_version = 8
 
-    # Save to temp file
-    with tempfile.NamedTemporaryFile(suffix=".onnx", delete=False) as f:
-        model_path = f.name
-        onnx.save(model, model_path)
-
+    model_path = test_utils.save_model(model)
     try:
-        # Create session with IREE EP
-        sess_options = ort.SessionOptions()
+        session = test_utils.create_session(model_path, device, {"target_arch": "host"})
 
-        # Provider options for IREE EP.
-        provider_options = {
-            "target_arch": "vulkan-spirv",
-            "save_intermediates": "1",
-        }
-        sess_options.add_provider_for_devices([iree_device], provider_options)
-
-        session = ort.InferenceSession(model_path, sess_options=sess_options)
-
-        # Prepare inputs
         expected = a + b
-
-        # Run inference
         outputs = session.run(None, {"A": a})
         result = outputs[0]
 
-        # Verify output
         if result.shape != expected.shape:
             print(f"FAIL: Shape mismatch: {result.shape} vs {expected.shape}")
             return False
@@ -123,5 +80,6 @@ def test_ep_load():
 
 
 if __name__ == "__main__":
+    test_utils.register_ep()
     success = test_ep_load()
     sys.exit(0 if success else 1)
